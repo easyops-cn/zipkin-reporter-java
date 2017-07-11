@@ -169,18 +169,23 @@ final class ByteBoundedQueue implements EventHandler<SpanEvent>, TimeoutHandler,
   private Callback sendSpansCallback(final int count, final int bytes) {
     return new Callback() {
       @Override public void onComplete() {
-        queuedSpans.addAndGet(-count);
-        sizeInBytes.addAndGet(-bytes);
-        metrics.updateQueuedSpans(queuedSpans.get());
-        metrics.updateQueuedBytes(sizeInBytes.get());
+        updateQueueSizeAndBytes();
       }
 
       @Override public void onError(Throwable t) {
+        updateQueueSizeAndBytes();
         metrics.incrementMessagesDropped(t);
         metrics.incrementSpansDropped(count);
         logger.log(WARNING,
                 format("Dropped %s spans due to %s(%s)", count, t.getClass().getSimpleName(),
                         t.getMessage() == null ? "" : t.getMessage()), t);
+      }
+
+      private void updateQueueSizeAndBytes() {
+        queuedSpans.addAndGet(-count);
+        sizeInBytes.addAndGet(-bytes);
+        metrics.updateQueuedSpans(queuedSpans.get());
+        metrics.updateQueuedBytes(sizeInBytes.get());
       }
     };
   }
