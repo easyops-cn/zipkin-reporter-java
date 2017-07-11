@@ -44,7 +44,7 @@ public class AsyncReporterTest {
   }
 
   @Test
-  public void messageMaxBytes_defaultsToSender() {
+  public void messageMaxBytes_defaultsToSender() throws InterruptedException {
     AtomicInteger sentSpans = new AtomicInteger();
     reporter = AsyncReporter.builder(FakeSender.create()
         .onSpans(spans -> sentSpans.addAndGet(spans.size()))
@@ -53,30 +53,32 @@ public class AsyncReporterTest {
         .build();
 
     reporter.report(span);
-    reporter.report(span); // drops
+    Thread.sleep(20);  // schedule consumer thread.
     reporter.flush();
 
     assertThat(sentSpans.get()).isEqualTo(1);
   }
 
   @Test
-  public void messageMaxBytes_dropsWhenOverqueuing() {
+  public void messageMaxBytes_queuesWhenOverMessageMaxBytes() throws InterruptedException {
     AtomicInteger sentSpans = new AtomicInteger();
     reporter = AsyncReporter.builder(FakeSender.create()
         .onSpans(spans -> sentSpans.addAndGet(spans.size())))
         .messageMaxBytes(sizeInBytesOfSingleSpanMessage)
         .messageTimeout(0, TimeUnit.MILLISECONDS)
+        .metrics(metrics)
         .build();
 
     reporter.report(span);
-    reporter.report(span); // dropped the one that queued more than allowed bytes
-    reporter.flush();
+    reporter.report(span);
+    Thread.sleep(20);  // schedule consumer thread
 
     assertThat(sentSpans.get()).isEqualTo(1);
+    assertThat(metrics.queuedSpans()).isEqualTo(1);
   }
 
   @Test
-  public void messageMaxBytes_dropsWhenTooLarge() {
+  public void messageMaxBytes_dropsWhenTooLarge() throws InterruptedException {
     AtomicInteger sentSpans = new AtomicInteger();
     reporter = AsyncReporter.builder(FakeSender.create()
         .onSpans(spans -> sentSpans.addAndGet(spans.size())))
@@ -85,13 +87,14 @@ public class AsyncReporterTest {
         .build();
 
     reporter.report(span.toBuilder().addAnnotation(Annotation.create(1L, "fooooo", null)).build());
+    Thread.sleep(20);  // schedule consumer thread
     reporter.flush();
 
     assertThat(sentSpans.get()).isEqualTo(0);
   }
 
   @Test
-  public void queuedMaxSpans_dropsWhenOverqueuing() {
+  public void queuedMaxSpans_dropsWhenOverqueuing() throws InterruptedException {
     AtomicInteger sentSpans = new AtomicInteger();
     reporter = AsyncReporter.builder(FakeSender.create()
         .onSpans(spans -> sentSpans.addAndGet(spans.size())))
@@ -101,8 +104,8 @@ public class AsyncReporterTest {
 
     reporter.report(span);
     reporter.report(span); // dropped the one that queued more than allowed count
+    Thread.sleep(20);  // schedule consumer thread
     reporter.flush();
-
     assertThat(sentSpans.get()).isEqualTo(1);
   }
 
@@ -135,7 +138,7 @@ public class AsyncReporterTest {
   }
 
   @Test
-  public void flush_incrementsMetrics() {
+  public void flush_incrementsMetrics() throws InterruptedException {
     reporter = AsyncReporter.builder(FakeSender.create())
         .metrics(metrics)
         .messageMaxBytes(sizeInBytesOfSingleSpanMessage)
@@ -145,8 +148,8 @@ public class AsyncReporterTest {
     // Queue up 2 spans
     reporter.report(span);
     reporter.report(span);
+    Thread.sleep(20);  // schedule consumer thread
 
-    reporter.flush();
     assertThat(metrics.queuedSpans()).isEqualTo(1); // still one span in the backlog
     assertThat(metrics.queuedBytes()).isEqualTo(Encoder.THRIFT.encode(span).length);
     assertThat(metrics.messages()).isEqualTo(1);
@@ -160,7 +163,7 @@ public class AsyncReporterTest {
   }
 
   @Test
-  public void flush_incrementsMessagesDropped() {
+  public void flush_incrementsMessagesDropped() throws InterruptedException {
     reporter = AsyncReporter.builder(FakeSender.create()
         .onSpans(spans -> {
           throw new RuntimeException();
@@ -170,6 +173,7 @@ public class AsyncReporterTest {
         .build();
 
     reporter.report(span);
+    Thread.sleep(20);  // schedule consumer thread
 
     reporter.flush();
     assertThat(metrics.messagesDropped()).isEqualTo(1);
@@ -232,8 +236,8 @@ public class AsyncReporterTest {
 
     // the close latch counts down when the thread is stopped
     BoundedAsyncReporter<Span> impl = (BoundedAsyncReporter<Span>) reporter;
-    assertThat(impl.close.await(3, TimeUnit.MILLISECONDS))
-        .isTrue();
+    assertThat(impl.isConsumerThreadClose())
+            .isTrue();
   }
 
   @Test(expected = IllegalStateException.class)
@@ -264,7 +268,7 @@ public class AsyncReporterTest {
 
   FakeSender sleepingSender = FakeSender.create().onSpans(spans -> {
     try {
-      Thread.sleep(5);
+      Thread.sleep(500);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
@@ -275,6 +279,7 @@ public class AsyncReporterTest {
     reporter = AsyncReporter.builder(sleepingSender)
         .metrics(metrics)
         .messageMaxBytes(sizeInBytesOfSingleSpanMessage)
+        .messageTimeout(50, TimeUnit.MILLISECONDS)
         .build();
 
     reporter.report(span);
@@ -304,10 +309,10 @@ public class AsyncReporterTest {
         }))
         .metrics(metrics)
         .messageMaxBytes(sizeInBytesOfSingleSpanMessage)
+        .messageTimeout(50, TimeUnit.MILLISECONDS)
         .build();
 
     reporter.report(span);
-    reporter.report(span); // pending as the flush thread is blocked
     received.await(); // wait for the first span to send
     reporter.close(); // close while there's a pending span
     sent.countDown(); // release the flush thread
@@ -355,11 +360,11 @@ public class AsyncReporterTest {
     long start = System.nanoTime();
     reporter.close(); // close while there's a pending span
     assertThat(System.nanoTime() - start)
-        .isLessThan(TimeUnit.MILLISECONDS.toNanos(10)); // give wiggle room
+        .isLessThan(TimeUnit.MILLISECONDS.toNanos(100)); // give wiggle room
   }
 
   @Test
-  public void flush_incrementsMetricsAndThrowsWhenClosed() {
+  public void flush_incrementsMetricsAndThrowsWhenClosed() throws InterruptedException {
     reporter = AsyncReporter.builder(sleepingSender)
         .metrics(metrics)
         .messageTimeout(0, TimeUnit.MILLISECONDS)
@@ -367,23 +372,24 @@ public class AsyncReporterTest {
 
     reporter.report(span);
 
-    reporter.close();
+    reporter.close(); // close() will report the queueing span but not sure the span can be sent
     try {
       reporter.flush();
       failBecauseExceptionWasNotThrown(IllegalStateException.class);
     } catch (IllegalStateException e) {
-      assertThat(metrics.spansDropped()).isEqualTo(1);
+      assertThat(metrics.spans()).isEqualTo(1);
     }
   }
 
   @Test
-  public void flush_incrementsMetricsAndThrowsWhenSenderClosed() {
+  public void flush_incrementsMetricsAndThrowsWhenSenderClosed() throws InterruptedException {
     reporter = AsyncReporter.builder(sleepingSender)
         .metrics(metrics)
         .messageTimeout(0, TimeUnit.MILLISECONDS)
         .build();
 
     reporter.report(span);
+    Thread.sleep(20);  // schedule consumer thread.
 
     sleepingSender.close();
     try {

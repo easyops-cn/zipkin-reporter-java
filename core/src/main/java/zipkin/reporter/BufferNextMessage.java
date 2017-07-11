@@ -27,11 +27,13 @@ final class BufferNextMessage implements ByteBoundedQueue.Consumer {
   long deadlineNanoTime;
   int sizeInBytes;
   boolean bufferFull;
+  int rawBytes;
 
   BufferNextMessage(Sender sender, int maxBytes, long timeoutNanos) {
     this.sender = sender;
     this.maxBytes = maxBytes;
     this.timeoutNanos = timeoutNanos;
+    this.rawBytes = 0;
   }
 
   @Override
@@ -43,6 +45,7 @@ final class BufferNextMessage implements ByteBoundedQueue.Consumer {
 
     // If we can fit queued spans and the next into one message...
     if (includingNextVsMaxBytes <= 0) {
+      rawBytes += next.length;
       sizeInBytes = x;
 
       if (includingNextVsMaxBytes == 0) {
@@ -73,10 +76,17 @@ final class BufferNextMessage implements ByteBoundedQueue.Consumer {
     sizeInBytes = 0;
     bufferFull = false;
     deadlineNanoTime = 0;
+    rawBytes = 0;
     return result;
   }
 
   int sizeInBytes() {
     return sizeInBytes;
+  }
+
+  int size() { return buffer.size(); }
+
+  int getRawBytes() {
+    return rawBytes;
   }
 }

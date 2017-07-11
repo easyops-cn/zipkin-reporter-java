@@ -13,24 +13,24 @@
  */
 package zipkin.reporter;
 
+import com.lmax.disruptor.TimeoutException;
+
 import java.io.Flushable;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 import zipkin.Component;
 import zipkin.Span;
 
-import static java.lang.String.format;
-import static java.util.logging.Level.WARNING;
 import static zipkin.internal.Util.checkArgument;
 import static zipkin.internal.Util.checkNotNull;
 
 /**
  * As spans are reported, they are encoded and added to a pending queue. The task of sending spans
- * happens on a separate thread which calls {@link #flush()}. By doing so, callers are protected
+ * happens on a separate disruptor thread calls {@link ByteBoundedQueue#onEvent(SpanEvent, long, boolean)} ()}.
+ * By doing so, callers are protected
  * from latency or exceptions possible when exporting spans out of process.
  *
  * <p>Spans are bundled into messages based on size in bytes or a timeout, whichever happens first.
@@ -42,7 +42,7 @@ public abstract class AsyncReporter<S> implements Reporter<S>, Flushable, Compon
    * After a certain threshold, spans are drained and {@link Sender#sendSpans(List, Callback) sent}
    * to Zipkin collectors.
    */
-  public static AsyncReporter<zipkin.Span> create(Sender sender) {
+  public static AsyncReporter<Span> create(Sender sender) {
     return new Builder(sender).build();
   }
 
@@ -103,7 +103,7 @@ public abstract class AsyncReporter<S> implements Reporter<S>, Flushable, Compon
     }
 
     /**
-     * Default 1 second. 0 implies spans are {@link #flush() flushed} externally.
+     * Default 1 second. 0 implies spans are {@link ByteBoundedQueue#flush() flushed} externally.
      *
      * <p>Instead of sending one message at a time, spans are bundled into messages, up to {@link
      * Sender#messageMaxBytes()}. This timeout ensures that spans are not stuck in an incomplete
@@ -156,23 +156,6 @@ public abstract class AsyncReporter<S> implements Reporter<S>, Flushable, Compon
           encoder.encoding(), sender.encoding());
 
       final BoundedAsyncReporter<S> result = new BoundedAsyncReporter<>(this, encoder);
-
-      if (messageTimeoutNanos > 0) { // Start a thread that flushes the queue in a loop.
-        final BufferNextMessage consumer =
-            new BufferNextMessage(sender, messageMaxBytes, messageTimeoutNanos);
-        final Thread flushThread = new Thread(() -> {
-          try {
-            while (!result.closed.get()) {
-              result.flush(consumer);
-            }
-          } finally {
-            for (byte[] next : consumer.drain()) result.pending.offer(next);
-            result.close.countDown();
-          }
-        }, "AsyncReporter(" + sender + ")");
-        flushThread.setDaemon(true);
-        flushThread.start();
-      }
       return result;
     }
   }
@@ -186,18 +169,18 @@ public abstract class AsyncReporter<S> implements Reporter<S>, Flushable, Compon
     final int messageMaxBytes;
     final long messageTimeoutNanos;
     final long closeTimeoutNanos;
-    final CountDownLatch close;
     final ReporterMetrics metrics;
 
     BoundedAsyncReporter(Builder builder, Encoder<S> encoder) {
-      this.pending = new ByteBoundedQueue(builder.queuedMaxSpans, builder.queuedMaxBytes);
       this.sender = builder.sender;
       this.messageMaxBytes = builder.messageMaxBytes;
       this.messageTimeoutNanos = builder.messageTimeoutNanos;
       this.closeTimeoutNanos = builder.closeTimeoutNanos;
-      this.close = new CountDownLatch(builder.messageTimeoutNanos > 0 ? 1 : 0);
       this.metrics = builder.metrics;
       this.encoder = encoder;
+      this.pending = new ByteBoundedQueue(builder.queuedMaxSpans, builder.queuedMaxBytes,
+              builder.messageMaxBytes, builder.messageTimeoutNanos, metrics,
+              sender);
     }
 
     /** Returns true if the was encoded and accepted onto the queue. */
@@ -216,40 +199,6 @@ public abstract class AsyncReporter<S> implements Reporter<S>, Flushable, Compon
       }
     }
 
-    @Override
-    public final void flush() {
-      flush(new BufferNextMessage(sender, messageMaxBytes, 0));
-    }
-
-    void flush(BufferNextMessage bundler) {
-      if (closed.get()) throw new IllegalStateException("closed");
-
-      pending.drainTo(bundler, bundler.remainingNanos());
-
-      // record after flushing reduces the amount of gauge events vs on doing this on report
-      metrics.updateQueuedSpans(pending.count);
-      metrics.updateQueuedBytes(pending.sizeInBytes);
-
-      // loop around if we are running, and the bundle isn't full
-      // if we are closed, try to send what's pending
-      if (!bundler.isReady() && !closed.get()) return;
-
-      // Signal that we are about to send a message of a known size in bytes
-      metrics.incrementMessages();
-      metrics.incrementMessageBytes(bundler.sizeInBytes());
-      List<byte[]> nextMessage = bundler.drain();
-
-      // In failure case, we increment messages and spans dropped.
-      Callback failureCallback = sendSpansCallback(nextMessage.size());
-      try {
-        sender.sendSpans(nextMessage, failureCallback);
-      } catch (RuntimeException e) {
-        failureCallback.onError(e);
-        // Raise in case the sender was closed out-of-band.
-        if (e instanceof IllegalStateException) throw e;
-      }
-    }
-
     @Override public CheckResult check() {
       return sender.check();
     }
@@ -259,9 +208,9 @@ public abstract class AsyncReporter<S> implements Reporter<S>, Flushable, Compon
       if (!closed.compareAndSet(false, true)) return; // already closed
       try {
         // wait for in-flight spans to send
-        if (!close.await(closeTimeoutNanos, TimeUnit.NANOSECONDS)) {
-          logger.warning("Timed out waiting for in-flight spans to send");
-        }
+        pending.stop(closeTimeoutNanos, TimeUnit.NANOSECONDS);
+      } catch (TimeoutException e) {
+        logger.warning("Timed out waiting for in-flight spans to send");
       } catch (InterruptedException e) {
         logger.warning("Interrupted waiting for in-flight spans to send");
         Thread.currentThread().interrupt();
@@ -273,23 +222,18 @@ public abstract class AsyncReporter<S> implements Reporter<S>, Flushable, Compon
       }
     }
 
-    Callback sendSpansCallback(final int count) {
-      return new Callback() {
-        @Override public void onComplete() {
-        }
-
-        @Override public void onError(Throwable t) {
-          metrics.incrementMessagesDropped(t);
-          metrics.incrementSpansDropped(count);
-          logger.log(WARNING,
-              format("Dropped %s spans due to %s(%s)", count, t.getClass().getSimpleName(),
-                  t.getMessage() == null ? "" : t.getMessage()), t);
-        }
-      };
-    }
-
     @Override public String toString() {
       return "AsyncReporter(" + sender + ")";
+    }
+
+    @Override
+    public final void flush() {
+      if (closed.get()) throw new IllegalStateException("closed");
+      this.pending.flush();
+    }
+
+    public final boolean isConsumerThreadClose() {
+      return this.pending.is_close();
     }
   }
 }

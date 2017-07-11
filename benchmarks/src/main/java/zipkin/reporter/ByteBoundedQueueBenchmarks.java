@@ -15,21 +15,8 @@
 package zipkin.reporter;
 
 import java.util.concurrent.TimeUnit;
-import org.openjdk.jmh.annotations.AuxCounters;
-import org.openjdk.jmh.annotations.Benchmark;
-import org.openjdk.jmh.annotations.BenchmarkMode;
-import org.openjdk.jmh.annotations.Fork;
-import org.openjdk.jmh.annotations.Group;
-import org.openjdk.jmh.annotations.GroupThreads;
-import org.openjdk.jmh.annotations.Level;
-import org.openjdk.jmh.annotations.Measurement;
-import org.openjdk.jmh.annotations.Mode;
-import org.openjdk.jmh.annotations.OutputTimeUnit;
-import org.openjdk.jmh.annotations.Scope;
-import org.openjdk.jmh.annotations.Setup;
-import org.openjdk.jmh.annotations.State;
-import org.openjdk.jmh.annotations.TearDown;
-import org.openjdk.jmh.annotations.Warmup;
+
+import org.openjdk.jmh.annotations.*;
 
 @Measurement(iterations = 5, time = 1)
 @Warmup(iterations = 10, time = 1)
@@ -73,10 +60,14 @@ public class ByteBoundedQueueBenchmarks {
   }
 
   ByteBoundedQueue q;
+  @Param
+  public Encoding encoding;
+  static final InMemoryReporterMetrics metrics = new InMemoryReporterMetrics();
 
   @Setup
   public void setup() {
-    q = new ByteBoundedQueue(10000, 10000);
+    q = new ByteBoundedQueue(10000, 10000, 10000, 1000000000,
+            metrics, new NoopSender(encoding));
   }
 
   @Benchmark @Group("no_contention") @GroupThreads(1)
@@ -88,14 +79,6 @@ public class ByteBoundedQueueBenchmarks {
     }
   }
 
-  @Benchmark @Group("no_contention") @GroupThreads(1)
-  public void no_contention_drain(DrainCounters counters, ConsumerMarker cm) {
-    q.drainTo(buffer -> {
-      counters.drained++;
-      return true;
-    }, 1000);
-  }
-
   @Benchmark @Group("mild_contention") @GroupThreads(2)
   public void mild_contention_offer(OfferCounters counters) {
     if (q.offer(ONE)) {
@@ -105,14 +88,6 @@ public class ByteBoundedQueueBenchmarks {
     }
   }
 
-  @Benchmark @Group("mild_contention") @GroupThreads(1)
-  public void mild_contention_drain(DrainCounters counters, ConsumerMarker cm) {
-    q.drainTo(buffer -> {
-      counters.drained++;
-      return true;
-    }, 1000);
-  }
-
   @Benchmark @Group("high_contention") @GroupThreads(8)
   public void high_contention_offer(OfferCounters counters) {
     if (q.offer(ONE)) {
@@ -120,14 +95,6 @@ public class ByteBoundedQueueBenchmarks {
     } else {
       counters.offersFailed++;
     }
-  }
-
-  @Benchmark @Group("high_contention") @GroupThreads(1)
-  public void high_contention_drain(DrainCounters counters, ConsumerMarker cm) {
-    q.drainTo(buffer -> {
-      counters.drained++;
-      return true;
-    }, 1000);
   }
 
   @TearDown(Level.Iteration)

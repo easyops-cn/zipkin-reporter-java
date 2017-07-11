@@ -13,18 +13,30 @@
  */
 package zipkin.reporter;
 
-import java.util.ArrayList;
-import java.util.List;
 import org.junit.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class ByteBoundedQueueTest {
-  ByteBoundedQueue queue = new ByteBoundedQueue(10, 10);
+  private final int MAX_SIZE = 10;
+  private final int MAX_BYTES = 10;
+  private final int MAX_TIMEOUT_NANOS = 1000000000;
+  private final int MAX_MESSAGE_BYTES = 10;
+  FakeSender sleepingSender = FakeSender.create().onSpans(spans -> {
+    try {
+      Thread.sleep(500);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  });
+  private ReporterMetrics reporterMetrics = ReporterMetrics.NOOP_METRICS;
+  private ByteBoundedQueue queue = new ByteBoundedQueue(
+          MAX_SIZE, MAX_BYTES, MAX_MESSAGE_BYTES, MAX_TIMEOUT_NANOS,
+          reporterMetrics, sleepingSender);
 
   @Test
   public void offer_failsWhenFull_size() {
-    for (int i = 0; i < queue.maxSize; i++) {
+    for (int i = 0; i < this.MAX_SIZE; i++) {
       assertThat(queue.offer(new byte[1])).isTrue();
     }
     assertThat(queue.offer(new byte[1])).isFalse();
@@ -32,41 +44,23 @@ public class ByteBoundedQueueTest {
 
   @Test
   public void offer_failsWhenFull_sizeInBytes() {
-    assertThat(queue.offer(new byte[10])).isTrue();
+    assertThat(queue.offer(new byte[this.MAX_BYTES])).isTrue();
     assertThat(queue.offer(new byte[1])).isFalse();
   }
 
   @Test
   public void offer_updatesCount() {
-    for (int i = 0; i < queue.maxSize; i++) {
+    for (int i = 0; i < this.MAX_SIZE; i++) {
       queue.offer(new byte[1]);
     }
-    assertThat(queue.count).isEqualTo(10);
+    assertThat(queue.queuedSpans.get()).isEqualTo(this.MAX_SIZE);
   }
 
   @Test
   public void offer_sizeInBytes() {
-    for (int i = 0; i < queue.maxSize; i++) {
+    for (int i = 0; i < MAX_SIZE; i++) {
       queue.offer(new byte[1]);
     }
-    assertThat(queue.sizeInBytes).isEqualTo(queue.maxSize);
-  }
-
-  @Test
-  public void circular() {
-    ByteBoundedQueue queue = new ByteBoundedQueue(10, 10);
-
-    List<Integer> polled = new ArrayList<>();
-    ByteBoundedQueue.Consumer consumer = buffer -> polled.add((int) buffer[0]);
-
-    // Offer more than the capacity, flushing via poll on interval
-    for (byte i = 0; i < 15; i++) {
-      queue.offer(new byte[] {i});
-      queue.drainTo(consumer, 1);
-    }
-
-    // ensure we have all of the elements
-    assertThat(polled)
-        .containsExactly(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+    assertThat(queue.sizeInBytes.get()).isEqualTo(MAX_SIZE);
   }
 }
